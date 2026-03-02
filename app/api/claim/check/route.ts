@@ -4,30 +4,48 @@
  * See project.md §9.2, §5.
  */
 import { NextRequest, NextResponse } from "next/server";
+import { runPipeline } from "@/lib/pipeline/run-pipeline";
 
 export async function POST(request: NextRequest) {
-  // TODO: Parse body: { episodeId?: string, sentenceId?: string, selectedText: string }
-  // TODO: Optional: get userId from Supabase session for claims.user_id
-  // TODO: Call lib/pipeline/run-pipeline (normalize → cache check → extract → classify → search → evaluate → persist)
-  // TODO: Return structured result (ClaimResult type)
-  const body = await request.json().catch(() => ({}));
-  const { episodeId, sentenceId, selectedText } = body;
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json(
+      { error: "Invalid JSON body" },
+      { status: 400 }
+    );
+  }
 
-  if (!selectedText || typeof selectedText !== "string") {
+  const obj = body && typeof body === "object" ? (body as Record<string, unknown>) : {};
+  const episodeId =
+    typeof obj.episodeId === "string" && obj.episodeId.trim()
+      ? obj.episodeId.trim()
+      : undefined;
+  const sentenceId =
+    typeof obj.sentenceId === "string" ? obj.sentenceId : undefined;
+  const selectedText = typeof obj.selectedText === "string" ? obj.selectedText : "";
+
+  if (!selectedText.trim()) {
     return NextResponse.json(
       { error: "Missing or invalid 'selectedText' in body" },
       { status: 400 }
     );
   }
 
-  // Placeholder response
-  return NextResponse.json({
-    claimClassification: "",
-    accuracyPercentage: 0,
-    contextSummary: "",
-    supportingEvidence: [],
-    contradictingEvidence: [],
-    confidenceScore: 0,
-    sources: [],
-  });
+  try {
+    const result = await runPipeline({
+      episodeId,
+      sentenceId,
+      selectedText: selectedText.trim(),
+      userId: null,
+    });
+    return NextResponse.json(result);
+  } catch (err) {
+    console.error("[claim/check]", err);
+    return NextResponse.json(
+      { error: "Claim check failed. Please try again." },
+      { status: 500 }
+    );
+  }
 }

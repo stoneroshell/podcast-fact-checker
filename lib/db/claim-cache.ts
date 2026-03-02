@@ -5,9 +5,17 @@
 import { supabase } from "./client";
 import type { ClaimResult } from "@/types/claim";
 
-export async function getCachedClaim(normalizedClaimHash: string): Promise<ClaimResult | null> {
-  // TODO: supabase.from("claim_cache").select("result_json").eq("normalized_claim_hash", hash).single()
-  return null;
+export async function getCachedClaim(
+  normalizedClaimHash: string
+): Promise<ClaimResult | null> {
+  const { data, error } = await supabase
+    .from("claim_cache")
+    .select("result_json")
+    .eq("normalized_claim_hash", normalizedClaimHash)
+    .maybeSingle();
+
+  if (error || !data?.result_json) return null;
+  return data.result_json as ClaimResult;
 }
 
 export async function setCachedClaim(
@@ -15,5 +23,12 @@ export async function setCachedClaim(
   normalizedClaimText: string,
   result: ClaimResult
 ): Promise<void> {
-  // TODO: supabase.from("claim_cache").upsert({ normalized_claim_hash, normalized_claim_text, result_json: result })
+  await supabase.from("claim_cache").upsert(
+    {
+      normalized_claim_hash: normalizedClaimHash,
+      normalized_claim_text: normalizedClaimText,
+      result_json: result,
+    },
+    { onConflict: "normalized_claim_hash" }
+  );
 }
