@@ -1,16 +1,20 @@
 /**
  * OpenAI claim pipeline: extract claim, classify, evaluate with structured output.
- * See project.md §5.1, §5.2.
+ * See project.md §5.1, §5.2, source-hierarchy.md v1.
  */
 import OpenAI from "openai";
-import type { ClaimResult } from "@/types/claim";
+import type { ClaimResult, SourceWithTier } from "@/types/claim";
 import {
   EXTRACT_CLAIM_SYSTEM,
   EXTRACT_CLAIM_USER,
+  EXTRACT_STRUCTURED_SYSTEM,
+  EXTRACT_STRUCTURED_USER,
   CLASSIFY_CLAIM_SYSTEM,
   CLASSIFY_CLAIM_USER,
   EVALUATE_CLAIM_SYSTEM,
   EVALUATE_CLAIM_USER,
+  EVALUATE_CLAIM_V1_SYSTEM,
+  EVALUATE_CLAIM_V1_USER,
 } from "./prompts";
 
 const openai = new OpenAI({
@@ -27,10 +31,69 @@ const CLASSIFICATION_TOKENS = [
   "rhetorical_statement",
 ] as const;
 
+const DOMAIN_TOKENS = [
+  "medical",
+  "legal",
+  "finance",
+  "politics",
+  "historical",
+  "tech",
+  "general",
+] as const;
+
+export type StructuredClaim = {
+  assertion: string;
+  entities?: string[];
+  dateRange?: string | null;
+  domain: string;
+  claimType: string;
+};
+
 function normalizeClassification(raw: string): string {
   const lower = raw.trim().toLowerCase().replace(/\s+/g, "_");
   const found = CLASSIFICATION_TOKENS.find((t) => lower === t || lower.startsWith(t));
   return found ?? "verifiable_factual_claim";
+}
+
+function normalizeDomain(raw: string): string {
+  const lower = raw.trim().toLowerCase();
+  const found = DOMAIN_TOKENS.find((t) => lower === t || lower.startsWith(t));
+  return found ?? "general";
+}
+
+/** v1: One LLM call for assertion, domain, claimType, optional entities/dateRange */
+export async function extractStructuredClaim(rawText: string): Promise<StructuredClaim> {
+  const completion = await openai.chat.completions.create({
+    model: MODEL,
+    messages: [
+      { role: "system", content: EXTRACT_STRUCTURED_SYSTEM },
+      { role: "user", content: EXTRACT_STRUCTURED_USER(rawText) },
+    ],
+    response_format: { type: "json_object" },
+    max_tokens: 300,
+  });
+  const content = completion.choices[0]?.message?.content?.trim() ?? "{}";
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(content) as Record<string, unknown>;
+  } catch {
+    return {
+      assertion: rawText,
+      domain: "general",
+      claimType: "verifiable_factual_claim",
+    };
+  }
+  const assertion = String(parsed.assertion ?? rawText).trim() || rawText;
+  const claimType = normalizeClassification(String(parsed.claimType ?? ""));
+  const domain = normalizeDomain(String(parsed.domain ?? ""));
+  const entities = Array.isArray(parsed.entities)
+    ? (parsed.entities as string[]).filter((e) => typeof e === "string")
+    : undefined;
+  const dateRange =
+    parsed.dateRange != null && parsed.dateRange !== ""
+      ? String(parsed.dateRange)
+      : undefined;
+  return { assertion, entities, dateRange, domain, claimType };
 }
 
 export async function extractCoreClaim(text: string): Promise<string> {
@@ -61,78 +124,107 @@ export async function classifyClaim(text: string): Promise<string> {
 
 export type SearchResultItem = { title: string; snippet: string; url: string };
 
+const VERDICT_TOKENS = ["True", "False", "Misleading", "Contested", "Insufficient Evidence"] as const;
+
+function normalizeVerdict(raw: string): ClaimResult["verdict"] {
+  const t = raw.trim();
+  const found = VERDICT_TOKENS.find((v) => t === v || t.toLowerCase() === v.toLowerCase());
+  return found ?? "Insufficient Evidence";
+}
+
+function verdictToAccuracy(verdict: ClaimResult["verdict"]): number {
+  switch (verdict) {
+    case "True": return 90;
+    case "False": return 10;
+    case "Misleading": return 45;
+    case "Contested": return 50;
+    case "Insufficient Evidence": return 0;
+    default: return 0;
+  }
+}
+
+/** v1: Accepts sources with tier; returns verdict + evidenceSummary; confidence set by pipeline. */
 export async function evaluateClaim(
-  coreClaim: string,
+  assertion: string,
   claimType: string,
-  searchResults: SearchResultItem[]
+  domain: string,
+  sourcesWithTier: SourceWithTier[]
 ): Promise<ClaimResult> {
-  const sourcesWithIds = searchResults.map((r, i) => ({
+  const sourcesWithIds = sourcesWithTier.map((s, i) => ({
     id: `s${i + 1}`,
-    url: r.url,
-    title: r.title,
-    snippet: r.snippet,
+    ...s,
   }));
   const sourcesText = sourcesWithIds
     .map(
       (s) =>
-        `[${s.id}] ${s.title}\n  URL: ${s.url}\n  Snippet: ${s.snippet}`
+        `[${s.id}] (Tier ${s.tier}) ${s.title ?? s.url}\n  URL: ${s.url}\n  Snippet: ${s.snippet ?? ""}`
     )
     .join("\n\n");
 
   const completion = await openai.chat.completions.create({
     model: MODEL,
     messages: [
-      { role: "system", content: EVALUATE_CLAIM_SYSTEM },
+      { role: "system", content: EVALUATE_CLAIM_V1_SYSTEM },
       {
         role: "user",
-        content: EVALUATE_CLAIM_USER(coreClaim, claimType, sourcesText),
+        content: EVALUATE_CLAIM_V1_USER(assertion, claimType, domain, sourcesText),
       },
     ],
     response_format: { type: "json_object" },
-    max_tokens: 1000,
+    max_tokens: 800,
   });
   const content = completion.choices[0]?.message?.content?.trim() ?? "{}";
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(content) as Record<string, unknown>;
   } catch {
-    return {
-      claimClassification: claimType,
-      accuracyPercentage: 0,
-      contextSummary: "Evaluation could not be parsed.",
-      supportingEvidence: [],
-      contradictingEvidence: [],
-      confidenceScore: 0,
-      sources: sourcesWithIds,
-    };
+    return buildClaimResult(claimType, sourcesWithTier, "Insufficient Evidence", "Evaluation could not be parsed.", 0);
   }
 
-  const byId = new Map(sourcesWithIds.map((s) => [s.id, s]));
-  const sourcesFromModel = Array.isArray(parsed.sources)
-    ? (parsed.sources as Array<{ id?: string; url?: string; title?: string; snippet?: string }>)
-    : [];
-  const sources: ClaimResult["sources"] = sourcesFromModel
-    .filter((s) => s.id && byId.has(s.id))
-    .map((s) => ({
-      id: s.id!,
-      url: byId.get(s.id!)!.url,
-      title: byId.get(s.id!)!.title,
-      snippet: byId.get(s.id!)!.snippet,
-    }));
+  const verdict = normalizeVerdict(String(parsed.verdict ?? ""));
+  const evidenceSummary = String(parsed.evidenceSummary ?? "").trim() || "No summary produced.";
+  return buildClaimResult(claimType, sourcesWithTier, verdict, evidenceSummary, 0);
+}
 
+function buildClaimResult(
+  claimType: string,
+  sourcesWithTier: SourceWithTier[],
+  verdict: ClaimResult["verdict"],
+  evidenceSummary: string,
+  confidence: number
+): ClaimResult {
+  const sources: ClaimResult["sources"] = sourcesWithTier.map((s, i) => ({
+    id: `s${i + 1}`,
+    url: s.url,
+    title: s.title ?? "",
+    snippet: s.snippet ?? "",
+  }));
   return {
+    verdict,
+    evidenceSummary,
+    sourcesUsed: sourcesWithTier,
+    confidence,
     claimClassification: claimType,
-    accuracyPercentage: Number(parsed.accuracyPercentage) ?? 0,
-    contextSummary: String(parsed.contextSummary ?? ""),
-    supportingEvidence: Array.isArray(parsed.supportingEvidence)
-      ? (parsed.supportingEvidence as ClaimResult["supportingEvidence"])
-      : [],
-    contradictingEvidence: Array.isArray(parsed.contradictingEvidence)
-      ? (parsed.contradictingEvidence as ClaimResult["contradictingEvidence"])
-      : [],
-    confidenceScore: Number(parsed.confidenceScore) ?? 0,
-    sources: sources.length > 0 ? sources : sourcesWithIds,
-    uncertaintyNote:
-      parsed.uncertaintyNote != null ? String(parsed.uncertaintyNote) : undefined,
+    accuracyPercentage: verdictToAccuracy(verdict),
+    contextSummary: evidenceSummary,
+    supportingEvidence: [],
+    contradictingEvidence: [],
+    confidenceScore: confidence,
+    sources,
   };
+}
+
+/** Build a ClaimResult for guardrail path (Insufficient Evidence, no evaluator call). */
+export function buildInsufficientEvidenceResult(
+  claimType: string,
+  sourcesWithTier: SourceWithTier[],
+  confidence: number
+): ClaimResult {
+  return buildClaimResult(
+    claimType,
+    sourcesWithTier,
+    "Insufficient Evidence",
+    "Fewer than 2 strong (Tier ≥3) sources; cannot reliably evaluate.",
+    confidence
+  );
 }

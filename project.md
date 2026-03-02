@@ -158,45 +158,45 @@ Supabase provides `auth.users`. Use a minimal `public.profiles` or rely on `auth
 
 ## 5. Fact-Checking Pipeline Architecture
 
+The fact-checking pipeline implements the **source-hierarchy** (v1) design: structured extraction, multi-query search, tier-based authority scoring in code, single evaluator call, and deterministic confidence. See **source-hierarchy.md** for full authority tiers, guardrails, and "what not to build" in v1.
+
 ### 5.1 Flow (Deterministic Structure)
 
 1. **Normalize input** — Trim, collapse whitespace, optional light cleanup (e.g. leading “So,” “And”).
 2. **Check caches**  
    - By `episode_id` + `sentence_id` or `selected_text` (if from episode).  
    - By `normalized_claim_hash` (global).
-3. **Extract core claim** — LLM step: single sentence, factual core (no hedging).
-4. **Classify claim type** — Verifiable fact / opinion / prediction / value judgment / rhetorical.
-5. **Generate search queries** — 1–3 queries from core claim (LLM or rules).
-6. **Web search** — Call SerpAPI (or fallback); top N results (e.g. N=5–8).
-7. **Retrieve content** — Optional: fetch snippets or minimal page text; stay within rate/budget.
-8. **Structured evaluation** — Single LLM call with:
-   - Core claim  
-   - Claim type  
-   - Search results + snippets  
-   - Structured output schema (see §5.2)
-9. **Persist** — Save to `claims` and optionally to `claim_cache` (by normalized text hash).
-10. **Return** — JSON to client.
+3. **Structured extraction** — One LLM call: core assertion (one sentence), entities, date range (if present), domain (medical | legal | finance | politics | historical | tech | general). Also classify claim type: verifiable fact / opinion / prediction / value judgment / rhetorical.
+4. **Multi-query search** — Run 2–3 queries: (1) assertion, (2) assertion + site:gov OR site:edu, (3) assertion + "fact check". Merge and dedupe by URL; rank by tier.
+5. **Authority scoring (code)** — Map each result's domain to tier; drop Tier 6; allow Tier 5 only if Tier 1–4 &lt; 2. If fewer than 2 sources Tier ≥3 → return "Insufficient Evidence" and do not call evaluator.
+6. **Structured evaluation** — Single LLM call with Tier ≥3 (or fallback) sources, assertion, claim type, domain. Evidence-only prompt; contradiction → Verdict: Contested. Output per §5.2.
+7. **Confidence (code)** — Compute 0–100 from source mix (e.g. 2× Tier 3 → 65–75%; Contested → cap 60%); do not let LLM set confidence.
+8. **Persist** — Save to `claims` and optionally to `claim_cache` (by normalized text hash). Map verdict, evidenceSummary, sourcesUsed (with tier), confidence to existing columns or extended schema.
+9. **Return** — JSON to client.
+
+Optional (v1): Snippets only; no full-page fetch. Retrieve content (fetch snippets or minimal page text) is Phase 2.
 
 ### 5.2 Output Schema (Structured JSON)
 
+v1 schema (see **source-hierarchy.md** §9):
+
 ```ts
 {
-  claimClassification: string;           // enum from §2
-  accuracyPercentage: number;            // 0–100
-  contextSummary: string;
-  supportingEvidence: Array<{ summary: string; sourceId: string; quote?: string }>;
-  contradictingEvidence: Array<{ summary: string; sourceId: string; quote?: string }>;
-  confidenceScore: number;               // 0–100
-  sources: Array<{ id: string; url: string; title: string; snippet: string }>;
-  uncertaintyNote?: string;              // when evidence is limited
+  verdict: "True" | "False" | "Misleading" | "Contested" | "Insufficient Evidence";
+  evidenceSummary: string;
+  sourcesUsed: Array<{ url: string; tier: 1 | 2 | 3 | 4 | 5 }>;
+  confidence: number;   // 0–100, computed in code
+  claimClassification?: string;   // enum from §2, from extraction step
 }
 ```
 
-Use OpenAI structured outputs (JSON schema or response format) to avoid drift.
+Use OpenAI structured outputs (JSON schema or response format) to avoid drift. Persist to `claims` / `claim_cache`: map `evidenceSummary` → context_summary, `sourcesUsed` → sources (with tier), `confidence` → confidence_score; store verdict (e.g. new column or encode in existing accuracy/context fields).
 
-### 5.3 Accuracy Scale (Single Scale)
+### 5.3 Verdict and Evidence Bands
 
-**Definition:** “Given available evidence, how well does the claim hold?”
+v1 primary output is **verdict**: True | False | Misleading | Contested | Insufficient Evidence (see §5.2). For display or legacy compatibility, accuracy bands can be derived from verdict. 
+
+**Definition (legacy bands):** “Given available evidence, how well does the claim hold?”
 
 | Band | Range | Label | Meaning |
 |------|--------|--------|---------|
@@ -204,17 +204,17 @@ Use OpenAI structured outputs (JSON schema or response format) to avoid drift.
 | Mixed | 31–70 | Mixed / nuanced | Conflicting or partial evidence |
 | High | 71–100 | Well supported | Evidence largely supports the claim |
 
-- Always pair with **context summary** and **uncertainty note** when confidence or evidence is limited.
-- Never present as “true/false”; present as evidence-based band + explanation.
+- Always pair with **evidence summary** and clear source tier labels when confidence or evidence is limited.
+- Never present unverified claims confidently; use **Insufficient Evidence** when strong_sources &lt; 2.
 
 ### 5.4 Confidence Score
 
-- **Confidence** = reliability of the analysis (source quality, clarity of evidence), not the same as accuracy.
-- 0–100: e.g. high when multiple strong sources agree; low when few or weak sources.
+- **Confidence** = reliability of the analysis (source quality, count), computed **in code** from source mix (see source-hierarchy.md v1). Not set by the LLM.
+- 0–100: e.g. 2× Tier 3 → 65–75%; 1× Tier 1 + 1× Tier 3 → 85–95%; Contested → cap at 60%.
 
 ### 5.5 Source Citation Format
 
-- Each piece of evidence references a `source_id` that maps to `sources[]`.
+- v1: Evidence references `sourcesUsed[]` with `url` and `tier`; map to `sources` for persistence.
 - Display: title (link), snippet, optional “Quote” in UI.
 - Store URLs and titles; avoid hallucinated URLs (validate or only use URLs returned by search API).
 

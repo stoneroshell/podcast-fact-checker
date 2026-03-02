@@ -21,7 +21,7 @@ export default function ClaimPanel({ result, isLoading }: ClaimPanelProps) {
     <aside>
       <ClaimSummary result={result} />
       <EvidenceList result={result} />
-      <SourceCitation sources={result.sources} />
+      <SourceCitation sourcesUsed={result.sourcesUsed} sources={result.sources} />
     </aside>
   );
 }
