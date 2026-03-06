@@ -1,15 +1,39 @@
 /**
- * Deterministic confidence from source mix and verdict.
+ * Deterministic confidence from source mix, verdict, and evidence agreement.
  * See source-hierarchy.md v1 Step 5; confidence is computed in code, not by LLM.
  */
 import type { ClaimVerdict, SourceWithTier } from "@/types/claim";
 
+export type EvidenceCounts = {
+  supporting: number;
+  contradicting: number;
+  neutral?: number;
+};
+
 export function computeConfidence(
   sourcesUsed: SourceWithTier[],
-  verdict: ClaimVerdict
+  verdict: ClaimVerdict,
+  evidenceCounts?: EvidenceCounts
 ): number {
-  if (verdict === "Contested") return Math.min(60, baseConfidence(sourcesUsed));
-  return baseConfidence(sourcesUsed);
+  let base = baseConfidence(sourcesUsed);
+  if (verdict === "Contested") base = Math.min(60, base);
+
+  if (evidenceCounts && evidenceCounts.supporting + evidenceCounts.contradicting > 0) {
+    const total = evidenceCounts.supporting + evidenceCounts.contradicting;
+    const agreementRatio = evidenceCounts.supporting / total;
+    if (agreementRatio >= 0.7) {
+      // High agreement: keep or slight boost
+      base = Math.min(100, base + 5);
+    } else if (agreementRatio <= 0.3) {
+      // Low agreement (mostly contradicting): cap
+      base = Math.min(base, 55);
+    } else {
+      // Split evidence: cap
+      base = Math.min(base, 65);
+    }
+  }
+
+  return Math.max(0, Math.min(100, base));
 }
 
 function baseConfidence(sources: SourceWithTier[]): number {

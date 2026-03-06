@@ -14,6 +14,12 @@ export default function ClaimSummary({ result }: ClaimSummaryProps) {
   return (
     <div>
       <p><strong>Verdict:</strong> {result.verdict}</p>
+      {result.consensusScore != null && (
+        <p><strong>Consensus:</strong> {result.consensusScore}%</p>
+      )}
+      {result.accuracyLabel && (
+        <p><strong>Accuracy:</strong> {result.accuracyLabel}</p>
+      )}
       <p><strong>Confidence:</strong> {confidence}%</p>
       <p>Classification: {result.claimClassification}</p>
       {summary && <p>{summary}</p>}

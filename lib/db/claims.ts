@@ -3,7 +3,8 @@
  * See project.md §4.2 (claims table), source-hierarchy v1.
  */
 import { supabase } from "./client";
-import type { ClaimResult, SourceWithTier } from "@/types/claim";
+import type { ClaimResult, ClaimEvidenceItem, SourceWithTier } from "@/types/claim";
+import { getAccuracyLabel } from "@/lib/pipeline/accuracy-rubric";
 
 type ClaimRow = {
   episode_id: string;
@@ -14,6 +15,7 @@ type ClaimRow = {
   context_summary: string;
   supporting_evidence: ClaimResult["supportingEvidence"];
   contradicting_evidence: ClaimResult["contradictingEvidence"];
+  neutral_evidence?: ClaimResult["neutralEvidence"];
   confidence_score: number;
   sources: ClaimResult["sources"];
   verdict?: string | null;
@@ -34,15 +36,18 @@ function rowToClaimResult(row: Record<string, unknown>): ClaimResult {
   const contextSummary = String(row.context_summary ?? "");
   const confidence = Number(row.confidence_score ?? 0);
   const verdict = String(row.verdict ?? "Insufficient Evidence") as ClaimResult["verdict"];
+  const accuracyScore = Number(row.accuracy_percentage ?? 0);
   return {
     verdict: ["True", "False", "Misleading", "Contested", "Insufficient Evidence"].includes(verdict)
       ? verdict
       : "Insufficient Evidence",
+    accuracyScore,
+    accuracyLabel: getAccuracyLabel(accuracyScore),
     evidenceSummary: contextSummary,
     sourcesUsed: sourcesToSourcesUsed(sources),
     confidence,
     claimClassification: String(row.classification ?? ""),
-    accuracyPercentage: Number(row.accuracy_percentage ?? 0),
+    accuracyPercentage: accuracyScore,
     contextSummary,
     supportingEvidence: Array.isArray(row.supporting_evidence)
       ? (row.supporting_evidence as ClaimResult["supportingEvidence"])
@@ -50,6 +55,9 @@ function rowToClaimResult(row: Record<string, unknown>): ClaimResult {
     contradictingEvidence: Array.isArray(row.contradicting_evidence)
       ? (row.contradicting_evidence as ClaimResult["contradictingEvidence"])
       : [],
+    neutralEvidence: Array.isArray(row.neutral_evidence) && (row.neutral_evidence as ClaimEvidenceItem[]).length > 0
+      ? (row.neutral_evidence as ClaimEvidenceItem[])
+      : undefined,
     confidenceScore: confidence,
     sources,
   };
@@ -67,6 +75,7 @@ export async function insertClaim(row: ClaimRow): Promise<string | null> {
       context_summary: row.context_summary,
       supporting_evidence: row.supporting_evidence,
       contradicting_evidence: row.contradicting_evidence,
+      neutral_evidence: row.neutral_evidence ?? [],
       confidence_score: row.confidence_score,
       sources: row.sources,
       ...(row.verdict != null && { verdict: row.verdict }),

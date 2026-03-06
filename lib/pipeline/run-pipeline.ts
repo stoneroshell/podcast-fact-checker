@@ -15,6 +15,7 @@ import {
 import { search } from "@/lib/search/serpapi";
 import { getTierFromUrl } from "@/lib/authority/domain-to-tier";
 import { computeConfidence } from "./confidence";
+import { computeConsensus, consensusToVerdict } from "./consensus";
 
 const MAX_SEARCH_RESULTS_AFTER_MERGE = Number(process.env.MAX_SEARCH_RESULTS) || 15;
 
@@ -101,6 +102,7 @@ export async function runPipeline(input: RunPipelineInput): Promise<ClaimResult>
           context_summary: result.contextSummary,
           supporting_evidence: result.supportingEvidence,
           contradicting_evidence: result.contradictingEvidence,
+          neutral_evidence: result.neutralEvidence ?? [],
           confidence_score: result.confidence,
           sources: sourcesWithTierForDb,
           verdict: result.verdict,
@@ -121,9 +123,28 @@ export async function runPipeline(input: RunPipelineInput): Promise<ClaimResult>
     tier: r.tier as 1 | 2 | 3 | 4 | 5,
   }));
 
-  const result = await evaluateClaim(assertion, claimType, domain, sourcesForEval);
-  result.confidence = computeConfidence(result.sourcesUsed, result.verdict);
-  result.confidenceScore = result.confidence;
+  const today = new Date().toISOString().split("T")[0];
+  const result = await evaluateClaim(assertion, claimType, domain, sourcesForEval, { today });
+
+  const supporting = result.supportingEvidence.length;
+  const contradicting = result.contradictingEvidence.length;
+  const neutral = result.neutralEvidence?.length ?? 0;
+  const consensus = computeConsensus(supporting, contradicting);
+  if (consensus !== null) {
+    result.consensusScore = consensus;
+    const verdictFromConsensus = consensusToVerdict(consensus);
+    if (verdictFromConsensus !== null) result.verdict = verdictFromConsensus;
+  }
+
+  let confidence = computeConfidence(result.sourcesUsed, result.verdict, {
+    supporting,
+    contradicting,
+    neutral,
+  });
+  const nonFactualTypes = ["opinion", "value_judgment", "prediction", "rhetorical_statement"];
+  if (nonFactualTypes.includes(claimType)) confidence = Math.min(confidence, 50);
+  result.confidence = confidence;
+  result.confidenceScore = confidence;
 
   await setCachedClaim(hash, normalized, result);
 
@@ -142,6 +163,7 @@ export async function runPipeline(input: RunPipelineInput): Promise<ClaimResult>
         context_summary: result.contextSummary,
         supporting_evidence: result.supportingEvidence,
         contradicting_evidence: result.contradictingEvidence,
+        neutral_evidence: result.neutralEvidence ?? [],
         confidence_score: result.confidence,
         sources: sourcesWithTierForDb,
         verdict: result.verdict,

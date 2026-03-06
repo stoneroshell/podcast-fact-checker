@@ -41,6 +41,10 @@ export type SourceWithTier = {
 export type ClaimResult = {
   /** v1: Verdict from evaluator; set to "Insufficient Evidence" when strong_sources < 2 (no evaluator call). */
   verdict: ClaimVerdict;
+  /** Iteration 2: 0–100 from evaluator; rubric-based. */
+  accuracyScore: number;
+  /** Iteration 2: Rubric band label derived in code from accuracyScore (e.g. "Accurate But Simplified"). */
+  accuracyLabel: string;
   /** v1: Primary evidence summary; alias contextSummary for backward compat. */
   evidenceSummary: string;
   /** v1: Sources used with tier; confidence is computed in code from this, not by LLM. */
@@ -48,11 +52,15 @@ export type ClaimResult = {
   /** 0–100; v1: computed in code from sourcesUsed + verdict, not by LLM. */
   confidence: number;
   claimClassification: string;
-  /** Legacy / backward compat. */
+  /** Legacy / backward compat; mirrors accuracyScore when set. */
   accuracyPercentage: number;
   contextSummary: string;
   supportingEvidence: ClaimEvidenceItem[];
   contradictingEvidence: ClaimEvidenceItem[];
+  /** Evidence that is relevant but neither clearly supporting nor contradicting. */
+  neutralEvidence?: ClaimEvidenceItem[];
+  /** 0–100; percentage of supporting vs (supporting + contradicting) sources; computed in code. */
+  consensusScore?: number;
   /** @deprecated use confidence */
   confidenceScore: number;
   sources: ClaimSource[];
