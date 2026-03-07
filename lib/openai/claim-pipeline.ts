@@ -315,11 +315,6 @@ export async function evaluateClaim(
   const contradictingEvidence = parseEvidenceArray(contradictingRaw, validIds);
   const neutralEvidence = parseEvidenceArray(neutralRaw, validIds);
 
-  if (process.env.NODE_ENV === "development") {
-    const rawKeys = Object.keys(parsed).filter((k) => /evidence|Evidence/i.test(k));
-    console.log("[claim-pipeline] evidence keys:", rawKeys, "| parsed counts: supporting=" + supportingEvidence.length + " contradicting=" + contradictingEvidence.length + " neutral=" + neutralEvidence.length);
-  }
-
   return buildClaimResult(claimType, sourcesWithTier, verdict, evidenceSummary, 0, accuracyScore, accuracyLabel, supportingEvidence, contradictingEvidence, neutralEvidence);
 }
 

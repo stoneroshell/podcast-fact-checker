@@ -158,7 +158,7 @@ Supabase provides `auth.users`. Use a minimal `public.profiles` or rely on `auth
 
 ## 5. Fact-Checking Pipeline Architecture
 
-The fact-checking pipeline implements the **source-hierarchy** (v1) design: structured extraction, multi-query search, tier-based authority scoring in code, single evaluator call, and deterministic confidence. See **source-hierarchy.md** for full authority tiers, guardrails, and "what not to build" in v1.
+The fact-checking pipeline implements the **source-hierarchy** (v1) design: structured extraction, **query diversification**, multi-query search, tier-based authority scoring in code, single evaluator call, **evidence clustering**, weighted consensus, and deterministic confidence. See **source-hierarchy.md** for authority tier definitions and **lib/authority/domain-to-tier.ts** for URL-to-tier mapping (with tier criteria comments).
 
 ### 5.1 Flow (Deterministic Structure)
 
@@ -167,34 +167,45 @@ The fact-checking pipeline implements the **source-hierarchy** (v1) design: stru
    - By `episode_id` + `sentence_id` or `selected_text` (if from episode).  
    - By `normalized_claim_hash` (global).
 3. **Structured extraction** — One LLM call: core assertion (one sentence), entities, date range (if present), domain (medical | legal | finance | politics | historical | tech | general). Also classify claim type: verifiable fact / opinion / prediction / value judgment / rhetorical.
-4. **Multi-query search** — Run 2–3 queries: (1) assertion, (2) assertion + site:gov OR site:edu, (3) assertion + "fact check". Merge and dedupe by URL; rank by tier.
-5. **Authority scoring (code)** — Map each result's domain to tier; drop Tier 6; allow Tier 5 only if Tier 1–4 &lt; 2. If fewer than 2 sources Tier ≥3 → return "Insufficient Evidence" and do not call evaluator.
-6. **Structured evaluation** — Single LLM call with Tier ≥3 (or fallback) sources, assertion, claim type, domain. Evidence-only prompt; contradiction → Verdict: Contested. Output per §5.2.
-7. **Confidence (code)** — Compute 0–100 from source mix (e.g. 2× Tier 3 → 65–75%; Contested → cap 60%); do not let LLM set confidence.
-8. **Persist** — Save to `claims` and optionally to `claim_cache` (by normalized text hash). Map verdict, evidenceSummary, sourcesUsed (with tier), confidence to existing columns or extended schema.
-9. **Return** — JSON to client.
+4. **Query diversification** — One LLM call: generate 3–5 verification queries from the assertion (direct, alternative phrasing, counterclaims). Fallback: use assertion only if generation fails.
+5. **Multi-query search** — Run search for each generated query plus two fixed authority queries: `assertion + site:gov OR site:edu` and `assertion + fact check`. Merge results by URL, dedupe, cap at configured limit. Tag results that came from the fact-check query for later weighting.
+6. **Authority scoring (code)** — Map each result URL to tier via `lib/authority/domain-to-tier`. Tier scale: 1 = highest authority, 6 = lowest. Drop Tier 6. Sort by tier ascending (best first). **Strong** = tier 1, 2, or 3 (tier ≤ 3). If fewer than 2 strong sources → return **Insufficient Evidence** and do not call the evaluator; persist and return.
+7. **Structured evaluation** — Single LLM call with strong sources only (tier ≤ 3, up to 8). Evidence-only prompt; classifies each source into supportingEvidence, contradictingEvidence, or neutralEvidence. Domain-specific rules apply (e.g. medical/health: correlation vs causation, observational vs clinical trials; use verdict **Contested** and cap accuracyScore when evidence is purely observational/correlational). Verdict can be True | False | Misleading | Contested | **Outdated** | Insufficient Evidence. **Outdated** = claim was historically well-supported but recent sources contradict it due to a time-sensitive shift (world changed), not an ongoing dispute.
+8. **Evidence clustering** — Group evidence by stance: **support**, **contradict**, **context** (neutral). Compute **consensusScore** (0–100) from cluster-level weights: supportWeight / (supportWeight + contradictWeight); context is not used in the ratio.
+9. **Verdict and accuracy** — If consensus is non-null, map consensus to verdict (e.g. >70 → True, 40–70 → Contested, <40 → False) and may override the LLM verdict; set accuracyScore/accuracyLabel to match. Apply overrides: (a) if a tier-1–3 fact-check source contradicts and verdict is True → Contested; (b) if claim has superlative/high-authority and verdict True, require consensus or tier-2/3 support bar or else Contested; (c) **coherence check**: if confidence < 55 and verdict is True or False → override to Contested (definitive verdict with low confidence is contradictory).
+10. **Confidence (code)** — Compute 0–100 from source mix, verdict, evidence weights, and **consensusScore**. High consensus for the claim → confidence floor; strong negative consensus (verdict False, consensus 0) → high confidence (sources agree the claim is false). Contested/Outdated cap confidence. Not set by the LLM.
+11. **Persist** — Save to `claims` and `claim_cache` (by normalized text hash). Map verdict, evidenceSummary, sourcesUsed (with tier), confidence, accuracyScore, consensusScore to schema.
+12. **Return** — JSON to client.
 
 Optional (v1): Snippets only; no full-page fetch. Retrieve content (fetch snippets or minimal page text) is Phase 2.
 
 ### 5.2 Output Schema (Structured JSON)
 
-v1 schema (see **source-hierarchy.md** §9):
+v1 schema (see **source-hierarchy.md** §9 and **types/claim.ts**):
 
 ```ts
 {
-  verdict: "True" | "False" | "Misleading" | "Contested" | "Insufficient Evidence";
+  verdict: "True" | "False" | "Misleading" | "Contested" | "Outdated" | "Insufficient Evidence";
+  accuracyScore: number;        // 0–100; from evaluator or overridden to match verdict
+  accuracyLabel: string;        // Rubric band (e.g. "Accurate But Simplified")
   evidenceSummary: string;
-  sourcesUsed: Array<{ url: string; tier: 1 | 2 | 3 | 4 | 5 }>;
-  confidence: number;   // 0–100, computed in code
-  claimClassification?: string;   // enum from §2, from extraction step
+  sourcesUsed: Array<{ url: string; title?: string; snippet?: string; tier: 1 | 2 | 3 | 4 | 5; weight?: number; fromFactCheckQuery?: boolean }>;
+  confidence: number;           // 0–100, computed in code; coherent with consensusScore
+  consensusScore?: number;      // 0–100, support/(support+contradict) by weight; null if no support/contradict
+  claimClassification: string;  // From extraction step
+  supportingEvidence: Array<{ summary: string; sourceId: string; quote?: string }>;
+  contradictingEvidence: Array<{ summary: string; sourceId: string; quote?: string }>;
+  neutralEvidence?: Array<{ summary: string; sourceId: string; quote?: string }>;
+  sources: Array<{ id: string; url: string; title: string; snippet: string }>;
+  // ... contextSummary, accuracyPercentage, confidenceScore (alias), uncertaintyNote
 }
 ```
 
-Use OpenAI structured outputs (JSON schema or response format) to avoid drift. Persist to `claims` / `claim_cache`: map `evidenceSummary` → context_summary, `sourcesUsed` → sources (with tier), `confidence` → confidence_score; store verdict (e.g. new column or encode in existing accuracy/context fields).
+Use OpenAI structured outputs (JSON schema or response format) to avoid drift. Persist to `claims` / `claim_cache`: map `evidenceSummary` → context_summary, `sourcesUsed` → sources (with tier), `confidence` → confidence_score; store verdict. Accuracy and consensus are kept coherent: when verdict is overridden from consensus or by coherence check, accuracyScore/accuracyLabel are set to match.
 
 ### 5.3 Verdict and Evidence Bands
 
-v1 primary output is **verdict**: True | False | Misleading | Contested | Insufficient Evidence (see §5.2). For display or legacy compatibility, accuracy bands can be derived from verdict. 
+v1 primary output is **verdict**: True | False | Misleading | Contested | **Outdated** | Insufficient Evidence. **Contested** = sources disagree now (genuine dispute). **Outdated** = claim was historically well-supported but recent sources contradict it due to a time-sensitive factual shift — the world changed. For display or legacy compatibility, accuracy bands can be derived from accuracyScore. 
 
 **Definition (legacy bands):** “Given available evidence, how well does the claim hold?”
 
@@ -205,12 +216,12 @@ v1 primary output is **verdict**: True | False | Misleading | Contested | Insuff
 | High | 71–100 | Well supported | Evidence largely supports the claim |
 
 - Always pair with **evidence summary** and clear source tier labels when confidence or evidence is limited.
-- Never present unverified claims confidently; use **Insufficient Evidence** when strong_sources &lt; 2.
+- Never present unverified claims confidently; use **Insufficient Evidence** when strong_sources &lt; 2 (strong = tier 1, 2, or 3).
 
 ### 5.4 Confidence Score
 
-- **Confidence** = reliability of the analysis (source quality, count), computed **in code** from source mix (see source-hierarchy.md v1). Not set by the LLM.
-- 0–100: e.g. 2× Tier 3 → 65–75%; 1× Tier 1 + 1× Tier 3 → 85–95%; Contested → cap at 60%.
+- **Confidence** = reliability of the analysis (source quality, evidence agreement, consensus), computed **in code** from source mix, verdict, and consensusScore (see **lib/pipeline/confidence.ts**). Not set by the LLM.
+- 0–100. High consensus for the claim raises or protects confidence; strong negative consensus (verdict False, consensus 0) yields high confidence (sources agree the claim is false). Contested/Outdated cap at 60. Kept coherent with accuracyScore and consensusScore so they do not contradict (e.g. consensus 100 with confidence 50 is avoided).
 
 ### 5.5 Source Citation Format
 
@@ -324,9 +335,15 @@ v1 primary output is **verdict**: True | False | Misleading | Contested | Insuff
     prompts.ts
   /search
     serpapi.ts                 # or duckduckgo.ts
+  /authority
+    domain-to-tier.ts          # URL → tier (1–6); tier criteria in comments
   /pipeline
     normalize.ts
     run-pipeline.ts
+    confidence.ts              # Deterministic confidence from sources, verdict, consensus
+    consensus.ts               # Weighted consensus from clusters; consensusToVerdict
+    source-weight.ts
+    accuracy-rubric.ts
 /types
   claim.ts
   episode.ts
@@ -418,7 +435,51 @@ Use a single `.env.example` with empty values and comments; never commit secrets
 
 ---
 
-## 10. Tone of This Document
+## 10. Implementation Chunks
+
+Phased implementation plan for Phase 1. Use for next-session planning.
+
+### Chunk A — Search and Episode APIs (done)
+
+- **Podcast Index client:** Auth (key + secret), `searchPodcasts`, `getEpisodeById`, `getEpisodesByFeedId` ([lib/podcast-index/client.ts](lib/podcast-index/client.ts)).
+- **Transcript:** Parse from PI transcript URL (JSON/SRT/plain) → [lib/transcript/parse-from-podcast-index.ts](lib/transcript/parse-from-podcast-index.ts).
+- **DB:** Column `podcast_index_episode_id` on `episodes`; [lib/db/episodes.ts](lib/db/episodes.ts) `getEpisodeById` (UUID or external id), `upsertEpisode`.
+- **Routes:** GET `/api/podcasts/search?q=`, GET `/api/podcasts/feed/[feedId]/episodes`, GET `/api/podcasts/episode/[id]` (UUID or Podcast Index id → fetch, transcript, upsert, return).
+
+### Chunk B — Wire Phase 1 UI (next)
+
+Wire the full Phase 1 user flow so a user can search → pick episode → see transcript → click sentence → see claim result. No new APIs; connect existing components and routes.
+
+1. **Home page** ([app/page.tsx](app/page.tsx))
+   - Render `SearchForm`. Add client state: query, results, loading.
+   - On input (debounced), GET `/api/podcasts/search?q=...`, display results (e.g. `EpisodeCard` per feed or per episode).
+   - Flow: either (a) search returns feeds → on feed click, GET `/api/podcasts/feed/[feedId]/episodes` → show episode list → link to `/episode/[episodeId]` (Podcast Index id), or (b) search returns episodes and link directly to `/episode/[id]`. Use episode id in URL so episode page can load it.
+   - Navigate to `/episode/[id]` when user selects an episode (id = Podcast Index episode id from feed/episodes response).
+
+2. **Episode page** ([app/episode/[id]/page.tsx](app/episode/[id]/page.tsx))
+   - Fetch episode: server-side (e.g. `getEpisodeById` from DB or fetch from API) or client fetch to GET `/api/podcasts/episode/[id]`. [id] can be Podcast Index id (first visit) or internal UUID (return visit).
+   - Render `EpisodeHeader` (title, cover, description), `TranscriptView` (sentences from `episode.transcript_json`), and `ClaimPanel` (side panel).
+   - If no transcript: show “Paste transcript” or upload; use POST `/api/transcript/parse` if needed, then display sentences as clickable.
+
+3. **Claim flow (client state + TranscriptView + ClaimPanel)**
+   - In a client wrapper (or episode page client section): state for `selectedSentence` (id + text), `claimResult` (`ClaimResult | null`), `isLoading`.
+   - `TranscriptView`: pass `onSelect(sentence)` so that on sentence click: set selected sentence, set `isLoading` true, POST `/api/claim/check` with body `{ episodeId: episode.id, sentenceId: sentence.id, selectedText: sentence.text }` (use internal `episode.id` from API response). On response: set `claimResult` to response JSON, set `isLoading` false.
+   - `ClaimPanel`: pass `result={claimResult}` and `isLoading`. Show loading state; when result is set, show claim type, verdict/accuracy band, context, evidence, sources (per §5.2, §9.1 components).
+
+4. **Components to wire**
+   - [SearchForm](app/components/podcast/SearchForm.tsx): state, debounced search, results list, navigate to episode or feed episodes.
+   - [EpisodeCard](app/components/podcast/EpisodeCard.tsx) / list: use in search or feed results; link to `/episode/[id]`.
+   - [EpisodeHeader](app/components/podcast/EpisodeHeader.tsx): receive episode, display title, image, description.
+   - [TranscriptView](app/components/transcript/TranscriptView.tsx): receive sentences; `onSelect` callback; replace no-op with actual claim-check call.
+   - [ClaimPanel](app/components/claim/ClaimPanel.tsx): already accepts `result` and `isLoading`; ensure parent passes them from claim flow state.
+
+5. **Out of scope for Chunk B**
+   - Landing page visual/style polish (separate pass).
+   - Auth, user history, rate limiting UI.
+
+---
+
+## 11. Tone of This Document
 
 This document is a product and technical reference: clear, structured, forward-looking, and pragmatic. Updates should keep the same tone and keep non-goals and phases explicit so future work stays aligned with the mission and budget.
 

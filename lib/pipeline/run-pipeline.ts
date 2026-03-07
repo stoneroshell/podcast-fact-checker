@@ -115,14 +115,6 @@ export async function runPipeline(input: RunPipelineInput): Promise<ClaimResult>
   // Tier scale: 1 = highest authority, 6 = lowest. Strong = tier 1, 2, or 3 (tier <= 3).
   noTier6.sort((a, b) => a.tier - b.tier);
 
-  if (process.env.NODE_ENV === "development") {
-    console.log("[run-pipeline] authority filter: sources and tier at filter time");
-    noTier6.forEach((r, i) => {
-      console.log(`  [${i + 1}] tier=${r.tier} url=${r.link}`);
-    });
-    console.log(`  strongCount (tier <= 3) = ${noTier6.filter((r) => r.tier <= 3).length}`);
-  }
-
   const strongCount = noTier6.filter((r) => r.tier <= 3).length;
 
   if (strongCount < 2) {
