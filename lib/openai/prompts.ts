@@ -3,7 +3,7 @@
  * See project.md §5, §6, source-hierarchy.md v1.
  */
 
-/** v1: Single structured extraction — assertion, domain, claimType, optional entities/dateRange */
+/** v1: Single structured extraction — assertion, domain, claimType, optional entities/dateRange, containsSuperlative, requiresHighAuthority */
 export const EXTRACT_STRUCTURED_SYSTEM = `You extract structured information from a claim (sentence or short paragraph). Respond with valid JSON only, no markdown or extra text.
 
 Output shape:
@@ -12,10 +12,14 @@ Output shape:
   "entities": ["optional array of main named entities: people, orgs, places"],
   "dateRange": "optional string if the claim mentions a specific time period, else omit or null",
   "domain": "one of: medical, legal, finance, politics, historical, tech, general",
-  "claimType": "one of: verifiable_factual_claim, opinion, prediction, value_judgment, rhetorical_statement"
+  "claimType": "one of: verifiable_factual_claim, opinion, prediction, value_judgment, rhetorical_statement",
+  "containsSuperlative": boolean,
+  "requiresHighAuthority": boolean
 }
 
-Rules: assertion must be a single clear sentence. domain describes the subject area (e.g. health → medical, courts → legal, markets → finance, elections → politics, past events → historical, software/AI → tech). claimType: verifiable_factual_claim = can be checked against sources; opinion = subjective; prediction = forward-looking; value_judgment = moral/aesthetic; rhetorical_statement = not literal fact.`;
+Rules: assertion must be a single clear sentence. domain describes the subject area (e.g. health → medical, courts → legal, markets → finance, elections → politics, past events → historical, software/AI → tech). claimType: verifiable_factual_claim = can be checked against sources; opinion = subjective; prediction = forward-looking; value_judgment = moral/aesthetic; rhetorical_statement = not literal fact.
+containsSuperlative: true if the claim contains a superlative (longest, shortest, biggest, smallest, first, most, least, oldest, newest, etc.) that asserts a factual ranking or record.
+requiresHighAuthority: true for claims about well-known factual superlatives, basic geography, or widely taught facts where incorrect sources are common (e.g. "longest river", "largest country", "first person to...").`;
 
 export const EXTRACT_STRUCTURED_USER = (text: string) =>
   `Extract structured information from this claim:\n\n${text}`;
@@ -35,6 +39,22 @@ export const CLASSIFY_CLAIM_SYSTEM = `You classify sentences into exactly one of
 export const CLASSIFY_CLAIM_USER = (text: string) =>
   `Classify this sentence. Reply with only one token from the list:\n\n${text}`;
 
+/** Query diversification: generate 3–5 search queries to verify a claim (direct, alternative phrasing, counterclaims). */
+export const GENERATE_VERIFICATION_QUERIES_SYSTEM = `Given a factual claim, generate 3–5 search queries that would help verify it. Output valid JSON only, no markdown or extra text.
+
+Include:
+- direct verification (the claim or core assertion as a search query)
+- alternative phrasing (same claim reworded)
+- possible counterclaims or comparison queries (e.g. "X vs Y", "is X actually Y")
+
+Output shape:
+{ "queries": ["query 1", "query 2", "query 3", ...] }
+
+Each query must be a short string suitable for a web search. Generate exactly 3–5 queries.`;
+
+export const GENERATE_VERIFICATION_QUERIES_USER = (assertion: string) =>
+  `Generate 3–5 search queries to verify this claim:\n\n${assertion}\n\nExample style:\n["longest river in the world", "is the Nile longer than the Amazon", "Amazon river length compared to Nile", "which river is considered longest"]\n\nRespond with JSON: { "queries": ["...", "...", ...] }`;
+
 /** Iteration 2: Evidence-only evaluator; verdict + accuracyScore (rubric); confidence computed in code */
 export const EVALUATE_CLAIM_V1_SYSTEM = `You evaluate a claim against provided search results. You must base your answer ONLY on the provided search results. Do not use your training knowledge.
 
@@ -46,11 +66,20 @@ Evidence-only rules:
 - If the snippets do not clearly support or contradict the claim, use verdict "Misleading" or "Insufficient Evidence" and accuracyScore in the 40–59 or 0–39 range; explain in evidenceSummary.
 - Prefer evidence from higher-tier sources (tier 1–3). Note when evidence is from lower-tier or opinion-heavy sources.
 - If sources conflict materially on the core factual claim, output verdict "Contested" and present both sides in evidenceSummary; use accuracyScore 40–59.
+- Use verdict "Outdated" when the claim was historically well-supported but recent sources (within roughly 2 years) contradict it because of a time-sensitive factual shift (e.g. office holder changed, policy reversed, study superseded). Outdated means the world changed — not an ongoing dispute. If sources simply disagree now with no clear temporal pattern, use "Contested" instead.
 
 War, elections, and office holders: For claims about war (e.g. "X is at war with Y"), elections, or current office holders, require official declaration or consensus phrasing across the provided sources. If sources only describe conflict/escalation without a formal war declaration, or lack consensus on who holds office, use verdict "Contested" or "Insufficient Evidence" and explain in evidenceSummary. Do not treat headlines or escalation reports as proof of formal war or office status.
 
 Subjective claims (opinion, value_judgment, prediction, rhetorical_statement):
 - You may still evaluate. If there is no single factual answer, say so in evidenceSummary (e.g. "This is a subjective claim; sources reflect different viewpoints rather than a verifiable fact") and use verdict "Misleading" or a lower accuracyScore. Do not treat opinions as definitively true or false.
+
+Superlatives: For claims containing superlatives (longest, biggest, first, most, etc.), only treat as True if multiple high-tier sources agree; if only lower-tier or single sources support, prefer Contested or Insufficient Evidence.
+
+Medical and health domain: When the domain is medical or health, apply these rules strictly:
+- Distinguish correlation from causation. Claims that X "causes" or "makes" Y require evidence of causation; observational associations alone do not support a causal claim. Prefer "Misleading" or "Contested" and note "evidence shows association, not causation" in evidenceSummary when sources only report correlations.
+- If the evidence is exclusively observational or correlational and no contradicting evidence was found, set verdict to "Contested" and cap accuracyScore at 70. Absence of contradicting sources does not make a correlational claim True — it makes it unresolved. Do not return "True" for causal-sounding claims (e.g. "X makes you live longer") when the only support is observational/correlational. For such claims, classify sources that only report an association (not causation) as neutralEvidence, not supportingEvidence, so that the verdict is not overridden by consensus.
+- Actively look for contradicting evidence even when most sources agree. If the provided snippets are mostly supportive but any source notes limitations, conflicting studies, or lack of RCT evidence, classify that as contradictingEvidence or neutralEvidence and reflect the nuance in verdict and evidenceSummary.
+- Flag when a claim rests on observational studies rather than clinical trials or RCTs. In evidenceSummary, note if the evidence is observational; if the claim implies a causal or definitive health effect and the evidence is primarily observational, use verdict "Misleading" or "Contested" and accuracyScore 40–70 rather than "True". Do not give a clean True verdict for causal-sounding health claims when the underlying evidence is observational and nuanced.
 
 Accuracy score rubric — you must assign accuracyScore 0–100 using only this rubric. Match the score to the strength of support in the provided sources:
 - 95–100: Universally accepted fact (sources strongly agree)
@@ -60,13 +89,13 @@ Accuracy score rubric — you must assign accuracyScore 0–100 using only this 
 - 20–39: Mostly false
 - 0–19: False
 
-Evidence classification: Classify each provided source (by id) into exactly one of: supportingEvidence (supports the claim), contradictingEvidence (contradicts it), or neutralEvidence (relevant but neither clearly supporting nor contradicting). Use only source ids from the provided list. Each evidence item: { "summary": "brief description", "sourceId": "e.g. s1", "quote": "optional excerpt" }.
+Evidence classification: Classify each provided source (by id) into exactly one of: supportingEvidence (supports the claim), contradictingEvidence (contradicts it), or neutralEvidence (relevant but neither clearly supporting nor contradicting). Use only source ids from the provided list. Each evidence item must use the exact key "sourceId" (camelCase) and the value must be exactly one of: s1, s2, s3, ... (lowercase "s" plus the source number, e.g. s1 for the first source, s2 for the second). Do not use "source_id", "1", or "Source 1". Format: { "summary": "brief description", "sourceId": "s1", "quote": "optional excerpt" }.
 
-Output exactly one verdict: "True" | "False" | "Misleading" | "Contested" | "Insufficient Evidence".
+Output exactly one verdict: "True" | "False" | "Misleading" | "Contested" | "Outdated" | "Insufficient Evidence".
 
 Respond with valid JSON only (no markdown, no extra text):
 {
-  "verdict": "True" | "False" | "Misleading" | "Contested" | "Insufficient Evidence",
+  "verdict": "True" | "False" | "Misleading" | "Contested" | "Outdated" | "Insufficient Evidence",
   "accuracyScore": number,
   "evidenceSummary": "string summarizing what the sources say and how they relate to the claim",
   "supportingEvidence": [{"summary": "string", "sourceId": "string", "quote": "optional string"}],
@@ -80,8 +109,13 @@ export const EVALUATE_CLAIM_V1_USER = (
   domain: string,
   sourcesText: string,
   today: string
-) =>
-  `Current date: ${today}. Evaluate all claims relative to this date.\n\nClaim: ${assertion}\nClaim type: ${claimType}\nDomain: ${domain}\n\nSearch results (reference by id; tier in brackets):\n${sourcesText}\n\nEvaluate using ONLY these results. Classify each source into supportingEvidence, contradictingEvidence, or neutralEvidence. Respond with JSON: verdict, accuracyScore (0–100), evidenceSummary, supportingEvidence, contradictingEvidence, neutralEvidence.`;
+) => {
+  const isMedical = domain.toLowerCase() === "medical" || domain.toLowerCase() === "health";
+  const domainNote = isMedical
+    ? "\n\nThis is a medical/health claim: apply the medical-domain rules (correlation vs causation; if evidence is exclusively observational/correlational with no contradicting evidence, use verdict Contested and cap accuracyScore at 70 — absence of contradiction does not make a correlational claim True).\n\n"
+    : "\n\n";
+  return `Current date: ${today}. Evaluate all claims relative to this date.${domainNote}Claim: ${assertion}\nClaim type: ${claimType}\nDomain: ${domain}\n\nSearch results (reference by id; tier in brackets). Source ids are s1, s2, s3, ... use these exactly in your evidence arrays:\n${sourcesText}\n\nEvaluate using ONLY these results. Classify each source into supportingEvidence, contradictingEvidence, or neutralEvidence. Use the key "sourceId" and values s1, s2, s3, etc. Respond with JSON: verdict, accuracyScore (0–100), evidenceSummary, supportingEvidence, contradictingEvidence, neutralEvidence.`;
+};
 
 export const EVALUATE_CLAIM_SYSTEM = `You evaluate a claim against provided search results. Be neutral and analytical. Do not declare the claim "true" or "false." Instead:
 1. Summarize the context and nuance (contextSummary).

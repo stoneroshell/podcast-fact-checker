@@ -37,10 +37,9 @@ function rowToClaimResult(row: Record<string, unknown>): ClaimResult {
   const confidence = Number(row.confidence_score ?? 0);
   const verdict = String(row.verdict ?? "Insufficient Evidence") as ClaimResult["verdict"];
   const accuracyScore = Number(row.accuracy_percentage ?? 0);
+  const validVerdicts = ["True", "False", "Misleading", "Contested", "Outdated", "Insufficient Evidence"];
   return {
-    verdict: ["True", "False", "Misleading", "Contested", "Insufficient Evidence"].includes(verdict)
-      ? verdict
-      : "Insufficient Evidence",
+    verdict: validVerdicts.includes(verdict) ? verdict : "Insufficient Evidence",
     accuracyScore,
     accuracyLabel: getAccuracyLabel(accuracyScore),
     evidenceSummary: contextSummary,

@@ -8,6 +8,7 @@ export type ClaimVerdict =
   | "False"
   | "Misleading"
   | "Contested"
+  | "Outdated"
   | "Insufficient Evidence";
 
 export type ClaimClassification =
@@ -36,6 +37,10 @@ export type SourceWithTier = {
   title?: string;
   snippet?: string;
   tier: 1 | 2 | 3 | 4 | 5;
+  /** Numeric weight for weighted consensus (tier + optional fact-check bonus). */
+  weight?: number;
+  /** True if this result came from the "fact check" search query. */
+  fromFactCheckQuery?: boolean;
 };
 
 export type ClaimResult = {

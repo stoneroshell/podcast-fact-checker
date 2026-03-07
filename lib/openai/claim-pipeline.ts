@@ -15,6 +15,8 @@ import {
   EVALUATE_CLAIM_USER,
   EVALUATE_CLAIM_V1_SYSTEM,
   EVALUATE_CLAIM_V1_USER,
+  GENERATE_VERIFICATION_QUERIES_SYSTEM,
+  GENERATE_VERIFICATION_QUERIES_USER,
 } from "./prompts";
 import { getAccuracyLabel } from "@/lib/pipeline/accuracy-rubric";
 
@@ -48,6 +50,8 @@ export type StructuredClaim = {
   dateRange?: string | null;
   domain: string;
   claimType: string;
+  containsSuperlative: boolean;
+  requiresHighAuthority: boolean;
 };
 
 function normalizeClassification(raw: string): string {
@@ -83,6 +87,8 @@ export async function extractStructuredClaim(rawText: string): Promise<Structure
       assertion: rawText,
       domain: "general",
       claimType: "verifiable_factual_claim",
+      containsSuperlative: false,
+      requiresHighAuthority: false,
     };
   }
   const assertion = String(parsed.assertion ?? rawText).trim() || rawText;
@@ -95,7 +101,51 @@ export async function extractStructuredClaim(rawText: string): Promise<Structure
     parsed.dateRange != null && parsed.dateRange !== ""
       ? String(parsed.dateRange)
       : undefined;
-  return { assertion, entities, dateRange, domain, claimType };
+  const containsSuperlative =
+    parsed.containsSuperlative === true || String(parsed.containsSuperlative).toLowerCase() === "true";
+  const requiresHighAuthority =
+    parsed.requiresHighAuthority === true || String(parsed.requiresHighAuthority).toLowerCase() === "true";
+  return {
+    assertion,
+    entities,
+    dateRange,
+    domain,
+    claimType,
+    containsSuperlative,
+    requiresHighAuthority,
+  };
+}
+
+const VERIFICATION_QUERIES_MAX = 5;
+
+/**
+ * Generate 3–5 search queries to verify a claim (direct, alternative phrasing, counterclaims).
+ * Fallback: returns [assertion] if parsing fails or no valid queries.
+ */
+export async function generateVerificationQueries(assertion: string): Promise<string[]> {
+  const completion = await openai.chat.completions.create({
+    model: MODEL,
+    messages: [
+      { role: "system", content: GENERATE_VERIFICATION_QUERIES_SYSTEM },
+      { role: "user", content: GENERATE_VERIFICATION_QUERIES_USER(assertion) },
+    ],
+    response_format: { type: "json_object" },
+    max_tokens: 300,
+    temperature: 0.2,
+  });
+  const content = completion.choices[0]?.message?.content?.trim() ?? "{}";
+  try {
+    const parsed = JSON.parse(content) as Record<string, unknown>;
+    const raw = parsed.queries;
+    if (!Array.isArray(raw)) return [assertion];
+    const queries = (raw as unknown[])
+      .filter((q): q is string => typeof q === "string" && q.trim().length > 0)
+      .map((q) => q.trim())
+      .slice(0, VERIFICATION_QUERIES_MAX);
+    return queries.length > 0 ? queries : [assertion];
+  } catch {
+    return [assertion];
+  }
 }
 
 export async function extractCoreClaim(text: string): Promise<string> {
@@ -128,7 +178,7 @@ export async function classifyClaim(text: string): Promise<string> {
 
 export type SearchResultItem = { title: string; snippet: string; url: string };
 
-const VERDICT_TOKENS = ["True", "False", "Misleading", "Contested", "Insufficient Evidence"] as const;
+const VERDICT_TOKENS = ["True", "False", "Misleading", "Contested", "Outdated", "Insufficient Evidence"] as const;
 
 function normalizeVerdict(raw: string): ClaimResult["verdict"] {
   const t = raw.trim();
@@ -142,23 +192,71 @@ function verdictToAccuracy(verdict: ClaimResult["verdict"]): number {
     case "False": return 10;
     case "Misleading": return 45;
     case "Contested": return 50;
+    case "Outdated": return 45;
     case "Insufficient Evidence": return 0;
     default: return 0;
   }
 }
 
+/**
+ * Get an array from parsed LLM response; try multiple key names and nested shapes.
+ */
+function getEvidenceArray(parsed: Record<string, unknown>, ...keys: string[]): unknown {
+  for (const key of keys) {
+    const v = parsed[key];
+    if (Array.isArray(v)) return v;
+    if (v != null && typeof v === "object" && !Array.isArray(v)) {
+      const o = v as Record<string, unknown>;
+      const arr = o.items ?? o.data ?? o.entries ?? o.evidence;
+      if (Array.isArray(arr)) return arr;
+    }
+  }
+  return undefined;
+}
+
 const validSourceIds = (count: number) => new Set(Array.from({ length: count }, (_, i) => `s${i + 1}`));
+
+/**
+ * Normalize LLM source id to our canonical form (s1, s2, ...) for validIds lookup.
+ * Accepts: "s1", "s 1", "1", "Source 1", etc.
+ */
+function normalizeSourceId(raw: string, validIds: Set<string>): string | null {
+  const s = raw.trim().toLowerCase();
+  if (!s) return null;
+  if (validIds.has(s)) return s;
+  const match = s.match(/^s\s*(\d+)$/);
+  if (match) {
+    const canonical = `s${match[1]}`;
+    return validIds.has(canonical) ? canonical : null;
+  }
+  if (/^\d+$/.test(s)) {
+    const canonical = `s${s}`;
+    return validIds.has(canonical) ? canonical : null;
+  }
+  const numMatch = s.match(/(\d+)/);
+  if (numMatch) {
+    const canonical = `s${numMatch[1]}`;
+    return validIds.has(canonical) ? canonical : null;
+  }
+  return null;
+}
 
 function parseEvidenceArray(raw: unknown, validIds: Set<string>): ClaimEvidenceItem[] {
   if (!Array.isArray(raw)) return [];
-  return (raw as unknown[])
-    .filter((item): item is Record<string, unknown> => item != null && typeof item === "object")
-    .map((item) => ({
-      summary: String(item.summary ?? "").trim() || "No summary",
-      sourceId: String(item.sourceId ?? "").trim(),
-      quote: item.quote != null ? String(item.quote).trim() : undefined,
-    }))
-    .filter((e) => e.sourceId && validIds.has(e.sourceId));
+  const out: ClaimEvidenceItem[] = [];
+  for (const item of raw as unknown[]) {
+    if (item == null || typeof item !== "object") continue;
+    const rec = item as Record<string, unknown>;
+    const rawId = String(rec.sourceId ?? rec.source_id ?? rec.id ?? "").trim();
+    const sourceId = normalizeSourceId(rawId, validIds);
+    if (!sourceId) continue;
+    out.push({
+      summary: String(rec.summary ?? rec.text ?? "").trim() || "No summary",
+      sourceId,
+      quote: rec.quote != null ? String(rec.quote).trim() : undefined,
+    });
+  }
+  return out;
 }
 
 /** v1: Accepts sources with tier; returns verdict + evidenceSummary + evidence arrays; confidence set by pipeline. */
@@ -208,9 +306,20 @@ export async function evaluateClaim(
   const rawScore = Number(parsed.accuracyScore);
   const accuracyScore = Number.isFinite(rawScore) ? Math.max(0, Math.min(100, Math.round(rawScore))) : (verdict === "True" ? 85 : verdict === "False" ? 15 : 50);
   const accuracyLabel = getAccuracyLabel(accuracyScore);
-  const supportingEvidence = parseEvidenceArray(parsed.supportingEvidence, validIds);
-  const contradictingEvidence = parseEvidenceArray(parsed.contradictingEvidence, validIds);
-  const neutralEvidence = parseEvidenceArray(parsed.neutralEvidence, validIds);
+
+  const supportingRaw = getEvidenceArray(parsed, "supportingEvidence", "supporting_evidence", "supportingevidence");
+  const contradictingRaw = getEvidenceArray(parsed, "contradictingEvidence", "contradicting_evidence", "contradictingevidence");
+  const neutralRaw = getEvidenceArray(parsed, "neutralEvidence", "neutral_evidence", "neutralevidence");
+
+  const supportingEvidence = parseEvidenceArray(supportingRaw, validIds);
+  const contradictingEvidence = parseEvidenceArray(contradictingRaw, validIds);
+  const neutralEvidence = parseEvidenceArray(neutralRaw, validIds);
+
+  if (process.env.NODE_ENV === "development") {
+    const rawKeys = Object.keys(parsed).filter((k) => /evidence|Evidence/i.test(k));
+    console.log("[claim-pipeline] evidence keys:", rawKeys, "| parsed counts: supporting=" + supportingEvidence.length + " contradicting=" + contradictingEvidence.length + " neutral=" + neutralEvidence.length);
+  }
+
   return buildClaimResult(claimType, sourcesWithTier, verdict, evidenceSummary, 0, accuracyScore, accuracyLabel, supportingEvidence, contradictingEvidence, neutralEvidence);
 }
 

@@ -17,7 +17,7 @@ function normalizeCachedResult(raw: unknown): ClaimResult {
         return { url: s.url, title: s.title, snippet: s.snippet, tier: tier as 1 | 2 | 3 | 4 | 5 };
       });
   const verdict = (r.verdict as ClaimResult["verdict"]) ?? "Insufficient Evidence";
-  const validVerdicts = ["True", "False", "Misleading", "Contested", "Insufficient Evidence"];
+  const validVerdicts = ["True", "False", "Misleading", "Contested", "Outdated", "Insufficient Evidence"];
   const verdictNorm = validVerdicts.includes(String(verdict)) ? verdict : "Insufficient Evidence";
   const accuracyScore = Number(r.accuracyScore ?? r.accuracyPercentage ?? 0);
   const accuracyLabel = String(r.accuracyLabel ?? getAccuracyLabel(accuracyScore));

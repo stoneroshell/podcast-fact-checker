@@ -1,6 +1,14 @@
 /**
  * Map URL hostname/domain to source authority tier (1–6).
  * See source-hierarchy.md §2. v1: authority-from-domain only.
+ *
+ * Tier criteria (use when adding or reclassifying domains):
+ * - Tier 1: Primary sources (original research, official datasets, court rulings, official filings). v1 rarely assigns; .gov/.edu often treated as Tier 2.
+ * - Tier 2: Institutional authority — .gov, .edu, major intl bodies (WHO, UN, IMF, World Bank, EU), key agencies (CDC, NIH, NASA, SEC).
+ * - Tier 3: High-standard journalism (Reuters, AP, BBC, NPR, etc.) OR established research institutes, NGOs, and government-adjacent statistical bodies. Recognized research orgs, peer-reviewed or institutionally backed, and established NGOs count here — not general web content.
+ * - Tier 4: Default for general news, blogs, and other sites that don’t meet Tier 1–3.
+ * - Tier 5: Aggregators / secondary compilations (Wikipedia, Statista, Britannica). Use only when Tier 1–4 results < 2.
+ * - Tier 6: User-generated / social (Reddit, Twitter, YouTube, etc.). Excluded from evaluator in v1.
  */
 
 export type Tier = 1 | 2 | 3 | 4 | 5 | 6;
@@ -38,7 +46,7 @@ const TIER_5_HOSTS = new Set([
   "www.investopedia.com",
 ]);
 
-/** Tier 3: high-standard journalism */
+/** Tier 3: high-standard journalism + established research institutes, NGOs, statistical bodies */
 const TIER_3_HOSTS = new Set([
   "reuters.com",
   "www.reuters.com",
@@ -70,6 +78,20 @@ const TIER_3_HOSTS = new Set([
   "www.dw.com",
   "france24.com",
   "www.france24.com",
+  "prisonpolicy.org",
+  "www.prisonpolicy.org",
+  "prb.org",
+  "www.prb.org",
+  "prisonstudies.org",
+  "www.prisonstudies.org",
+  "sentencingproject.org",
+  "www.sentencingproject.org",
+  "pewresearch.org",
+  "www.pewresearch.org",
+  "urban.org",
+  "www.urban.org",
+  "rand.org",
+  "www.rand.org",
 ]);
 
 /** Tier 2: institutional — .gov, .edu, intl bodies */

@@ -25,6 +25,7 @@ export async function POST(request: NextRequest) {
   const sentenceId =
     typeof obj.sentenceId === "string" ? obj.sentenceId : undefined;
   const selectedText = typeof obj.selectedText === "string" ? obj.selectedText : "";
+  const forceRefresh = obj.forceRefresh === true;
 
   if (!selectedText.trim()) {
     return NextResponse.json(
@@ -39,6 +40,7 @@ export async function POST(request: NextRequest) {
       sentenceId,
       selectedText: selectedText.trim(),
       userId: null,
+      forceRefresh,
     });
     return NextResponse.json(result);
   } catch (err) {

@@ -1,6 +1,8 @@
 /**
  * Deterministic confidence from source mix, verdict, and evidence agreement.
  * See source-hierarchy.md v1 Step 5; confidence is computed in code, not by LLM.
+ * High certainty that the claim is false (unanimous contradiction) should produce high confidence,
+ * not low — consensusScore 0 with verdict False means sources agree the claim is wrong.
  */
 import type { ClaimVerdict, SourceWithTier } from "@/types/claim";
 
@@ -8,32 +10,73 @@ export type EvidenceCounts = {
   supporting: number;
   contradicting: number;
   neutral?: number;
+  /** When set, use weight-based agreement ratio instead of count-based (so high-tier contradiction reduces confidence more). */
+  supportingWeight?: number;
+  contradictingWeight?: number;
 };
 
+/**
+ * Optional consensus score (0–100). When provided, confidence is kept coherent with it:
+ * high consensus cannot yield very low confidence, and very low consensus caps confidence.
+ */
 export function computeConfidence(
   sourcesUsed: SourceWithTier[],
   verdict: ClaimVerdict,
-  evidenceCounts?: EvidenceCounts
+  evidenceCounts?: EvidenceCounts,
+  consensusScore?: number | null
 ): number {
   let base = baseConfidence(sourcesUsed);
-  if (verdict === "Contested") base = Math.min(60, base);
+  if (verdict === "Contested" || verdict === "Outdated") base = Math.min(60, base);
 
-  if (evidenceCounts && evidenceCounts.supporting + evidenceCounts.contradicting > 0) {
-    const total = evidenceCounts.supporting + evidenceCounts.contradicting;
-    const agreementRatio = evidenceCounts.supporting / total;
-    if (agreementRatio >= 0.7) {
-      // High agreement: keep or slight boost
-      base = Math.min(100, base + 5);
-    } else if (agreementRatio <= 0.3) {
-      // Low agreement (mostly contradicting): cap
-      base = Math.min(base, 55);
-    } else {
-      // Split evidence: cap
-      base = Math.min(base, 65);
+  if (evidenceCounts) {
+    const totalCount = evidenceCounts.supporting + evidenceCounts.contradicting;
+    const totalWeight =
+      (evidenceCounts.supportingWeight ?? 0) + (evidenceCounts.contradictingWeight ?? 0);
+    const useWeights =
+      totalWeight > 0 &&
+      evidenceCounts.supportingWeight != null &&
+      evidenceCounts.contradictingWeight != null;
+    const agreementRatio =
+      useWeights
+        ? evidenceCounts.supportingWeight! / totalWeight
+        : totalCount > 0
+          ? evidenceCounts.supporting / totalCount
+          : null;
+    if (agreementRatio !== null) {
+      if (agreementRatio >= 0.7) {
+        base = Math.min(100, base + 5);
+      } else if (agreementRatio <= 0.3) {
+        if (verdict === "False" && totalWeight > 0) {
+          const contradictWeight = evidenceCounts.contradictingWeight ?? 0;
+          if (contradictWeight >= totalWeight * 0.9) {
+            base = Math.max(base, 75);
+          } else {
+            base = Math.min(base, 55);
+          }
+        } else {
+          base = Math.min(base, 55);
+        }
+      } else {
+        base = Math.min(base, 65);
+      }
     }
   }
 
-  return Math.max(0, Math.min(100, base));
+  let out = Math.max(0, Math.min(100, base));
+
+  if (consensusScore != null && Number.isFinite(consensusScore)) {
+    const c = Math.max(0, Math.min(100, Math.round(consensusScore)));
+    if (c >= 90) out = Math.max(out, 60);
+    else if (c <= 10) {
+      if (verdict === "False") {
+        out = Math.max(out, 70);
+      } else {
+        out = Math.min(out, 55);
+      }
+    }
+  }
+
+  return out;
 }
 
 function baseConfidence(sources: SourceWithTier[]): number {
